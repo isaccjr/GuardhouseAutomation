@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import List
 import os
@@ -12,39 +12,84 @@ import base64
 from vertexai.generative_models import GenerativeModel, Part, SafetySetting
 import vertexai
 import pandas as pd
+import logging
+import re 
+import pickle
+
+BUCKET_NAME="guardhouse_automation_bucket"
+FILE_NAME = "output"
+UPLOAD_DIRECTORY = "uploads"  # Diretório para salvar os uploads (localmente)
+
+# Configuração do logger
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+#Configuração do client de storage do Google Cloud Service
+storage_client = storage.Client()
+bucket = storage_client.bucket(BUCKET_NAME)
 
 
-def upload_imgs(imgs, img_type, uuid_str):
+
+
+def get_date(exif_data):
+    """Pega a data do EXIF de uma imagem."""
+
+    try:
+        datetime_original = exif_data.get('EXIF DateTimeOriginal')
+        datetime_digitized = exif_data.get('EXIF DateTimeDigitized')
+    except:
+        print('Erro ao obter metadados EXIF de data')
+        raise HTTPException(status_code=500, detail="Erro ao obter metadados EXIF de data")
+    if datetime_original:
+        return str(datetime_original.values) #converte para string
+    elif datetime_digitized:
+        return str(datetime_digitized.values) #converte para string
+    else:
+        return "Data não encontrada nos metadados EXIF"
+    
+def get_exif(img_bytes):
+    with io.BytesIO(img_bytes) as f:
+        exif_data = exifread.process_file(f)
+    return exif_data
+
+def upload_exif(uuid_str, img_type, file_uuid, data, bucket = bucket):
+    pickle_data = pickle.dumps(data)
+    file_name = f"{uuid_str}/{img_type}_exif/{file_uuid}"
+    blob = bucket.blob(file_name)
+    blob.upload_from_string(pickle_data)
+
+
+async def upload_imgs(imgs, img_type, uuid_str):
     """Uploads imagens para o Cloud Storage diretamente do conteúdo do arquivo."""
-
-    storage_client = storage.Client()
-    bucket_name = "guardhouse_automation_bucket"  # Substitua pelo nome do seu bucket
-    bucket = storage_client.bucket(bucket_name)
-    remote_files = []
-
     for img in imgs:
         if not img.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail=f"O arquivo '{img.name}' não é uma imagem.")
+            raise HTTPException(status_code=400, detail=f"O arquivo '{img.filename}' não é uma imagem.")
         # img agora é um objeto UploadFile do Streamlit
         try:
             file_uuid = str(uuid.uuid4())
             file_name = file_uuid #gera um unique id para cada arquivo para preservar a privacidade
             remote_name = f"{uuid_str}/{img_type}/{file_name}"
             blob = bucket.blob(remote_name)
+            try:
+                content = await img.read() #lê o conteudo da imagem com bytes
+                exif_data = get_exif(content) #pega os metadados do exif
+                upload_exif(uuid_str, img_type, file_uuid, exif_data) #upload dos metadados do exif
+            except:
+                print('Erro ao obter metadados EXIF')
+                raise HTTPException(status_code=500, detail="Erro ao obter metadados EXIF")
 
-            # A principal mudança: upload_from_file com BytesIO
-            blob.upload_from_file(io.BytesIO(img.getvalue()), content_type=img.type) #especifica o content type
-
+            #Upload da imagem
+            blob.upload_from_file(io.BytesIO(content), content_type=img.content_type) #especifica o content type
+            logger.info(f"Arquivo {img.filename} enviado para o GCS")
             url_img = blob.public_url
-            remote_files.append(url_img)
             print(f"Imagem {file_name} enviada para {url_img}.")
 
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Erro ao salvar o arquivo '{img.name}': {str(e)}")
+            logger.exception(f"Erro ao processar arquivo {img.filename}: {e}")
+            raise HTTPException(status_code=500, detail=f"Erro ao salvar o arquivo '{img.filename}': {str(e)}")
 
-    #return remote_files
 
-def list_files_gcs(uuid_str, bucket_name="guardhouse_automation_bucket", prefix_docs="documentos/", prefix_plates="placas/", verbose=1):
+def list_files_gcs(uuid_str, bucket_name=BUCKET_NAME, prefix_docs="documentos/", prefix_plates="placas/", verbose=1):
     """
     Lista arquivos em um bucket do Google Cloud Storage.
 
@@ -59,29 +104,45 @@ def list_files_gcs(uuid_str, bucket_name="guardhouse_automation_bucket", prefix_
         Retorna tuplas vazias caso ocorra algum erro na listagem.
     """
     try:
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(bucket_name)
+        docs_prefix = uuid_str + "/" + prefix_docs
+        plates_prefix = uuid_str + "/" + prefix_plates
+        
+        if verbose:
+            print(f"Prefixo para documentos: {docs_prefix}")
+            print(f"Prefixo para placas: {plates_prefix}")
 
-        docs_blobs = list(bucket.list_blobs(prefix=uuid_str + "/" + prefix_docs))
-        plates_blobs = list(bucket.list_blobs(prefix=uuid_str + "/" +prefix_plates))
+        docs_blobs = list(bucket.list_blobs(prefix=docs_prefix))
+        plates_blobs = list(bucket.list_blobs(prefix=plates_prefix))
 
+        if not docs_blobs or len(docs_blobs) == 0:
+            raise HTTPException(status_code=404, detail="Nenhum arquivo encontrado na pasta documentos")
+        if not plates_blobs or len(plates_blobs) == 0:
+            raise HTTPException(status_code=404, detail="Nenhum arquivo encontrado na pasta placas")
+        
         if verbose:
             print(f'Encontrados {len(docs_blobs)} arquivos na pasta documentos no bucket {bucket_name}')
             print(f'Encontrados {len(plates_blobs)} arquivos na pasta placas no bucket {bucket_name}')
 
         # Extrair os nomes dos arquivos (paths)
-        docs_paths = [blob.name for blob in docs_blobs]
-        plates_paths = [blob.name for blob in plates_blobs]
+        try:
+            docs_paths = [blob.name for blob in docs_blobs]
+            plates_paths = [blob.name for blob in plates_blobs]
+        except Exception as e:
+            print('Erro ao listar arquivos encontrados no bucket')
+            print(e)
+            raise HTTPException(status_code=500, detail="Erro ao listar arquivos encontrados no bucket")
 
+        print("Docs_paths, plates_path retornados com sucesso")
         return docs_paths, plates_paths
 
-    except Exception as e:  # Captura exceções genéricas para simplificar (melhorar com tratamento específico se necessário)
-        print(f"Erro ao listar arquivos do bucket: {e}")
-        return [], [] # Retorna tuplas vazias em caso de erro
+    except Exception as e:
+        print(f"Erro ao listar arquivos no bucket: {e}")
+        return [], []
+
 
 #extraindo metadados
 # Recebe um caminho para arquivo de imagem e pega a data do EXIF
-def get_image_datetime_gcs(image_url):
+def get_image_datetime_gcs(img_blob_name, bucket=bucket):
     """
     Obtém a data e hora de uma imagem armazenada no Google Cloud Storage.
 
@@ -91,17 +152,73 @@ def get_image_datetime_gcs(image_url):
     Returns:
         A data e hora da imagem (string), ou uma mensagem de erro.
     """
+    print("Obtendo data da imagem...")
     try:
-        storage_client = storage.Client()
-        blob = storage_client.get_blob_from_uri(image_url)
-        image_bytes = blob.download_as_bytes() #baixa os bytes da imagem
+        blob = bucket.blob(img_blob_name)
+        if blob.exists():
+            print('blob da imagem existe')
 
-        # Usando io.BytesIO para criar um objeto file-like a partir dos bytes
-        with io.BytesIO(image_bytes) as f:
-            tags = exifread.process_file(f)
+            try:
+                input_string = img_blob_name
+                pattern_plates = r'(.*)/placas/(.*)' 
+                pattern_docs = r'(.*)/documentos/(.*)'
+                try:
+                    match = None
+                    match_plates = re.match(pattern_plates, input_string)
+                    match_docs = re.match(pattern_docs, input_string)
+                    print("match_docs:")
+                    print(match_docs)
+                    print("match_plates:")
+                    print(match_plates)
+                except:
+                    print("Erro ao obter match")
+                if match_plates:
+                    print('É UM ARQUIVO EXIF DE PLACA')
+                    img_type = "placas"
+                    match = match_plates
+                if match_docs:
+                    print('É UM ARQUIVO EXIF DE DOCUMENTO')
+                    img_type = "documentos"
+                    match = match_docs
+                if match:
+                    uuid_str = match.group(1) 
+                    uuid_file = match.group(2)
+                    if img_type == "placas":
+                        exif_path = f"{uuid_str}/placas_exif/{uuid_file}" 
+                    elif img_type == "documentos":
+                        exif_path = f"{uuid_str}/documentos_exif/{uuid_file}"
+                if match==None:
+                    print(input_string)
+                    print('Erro ao obter tipo de imagem do blob exif')
 
-        datetime_original = tags.get('EXIF DateTimeOriginal')
-        datetime_digitized = tags.get('EXIF DateTimeDigitized')
+                #Baixa o arquivo pickle com as tags exif preparadas do exifread    
+                try:
+                    exif_blob = bucket.blob(exif_path) 
+                    if exif_blob.exists(): #Se o blob existe
+                        print('blob exif existe') 
+                        exif_data = exif_blob.download_as_string() #Faz o download
+                    else: #Se não existe o blob do exif
+                        print('Exif path:')
+                        print(exif_path)
+                        print('blob exif não existe')
+                except:
+                    print("Erro ao obter blob exif")
+            except Exception as e:
+                print('Erro ao obter blob')
+                raise HTTPException(status_code=404, detail="Blob exif não encontrado")
+        else:
+            print('blob não existe')
+        
+        try:
+            try:
+                exif_data = pickle.loads(exif_data)
+            except:
+                raise HTTPException(status_code=500, detail="Erro ao serealizar o pickle do exif")
+            datetime_original = exif_data.get('EXIF DateTimeOriginal')
+            datetime_digitized = exif_data.get('EXIF DateTimeDigitized')
+        except:
+            print('Erro ao obter metadados EXIF de data')
+            raise HTTPException(status_code=500, detail="Erro ao obter metadados EXIF de data")
 
         if datetime_original:
             return str(datetime_original.values) #converte para string
@@ -111,23 +228,42 @@ def get_image_datetime_gcs(image_url):
             return "Data não encontrada nos metadados EXIF"
 
     except Exception as e:
-        return f"Erro ao obter data da imagem: {e}"
+        raise HTTPException(status_code=500, detail=f"Erro ao obter data da imagem: {e}")
 
 # Função para converter a string de data em um objeto datetime
 def parse_datetime(date_str):
-    return datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+    try:
+        return datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Formato de data inválido")
 
 #Função para organizar por data
 def sort_by_date(files_path, verbose=1):
-    files_date = list(map(get_image_datetime_gcs,files_path))
+    if files_path == []:
+        print('File paths vazio')
+        raise HTTPException(status_code=404, detail="Nenhum arquivo encontrado na lista de arquivos")
+    try:
+        files_date = list(map(get_image_datetime_gcs,files_path))
+    except:
+        print('Erro ao obter data da imagem')
+        raise HTTPException(status_code=500, detail="Erro ao obter data da imagem")
+    
+    print('Files_date:')
+    print(files_date)
+    #Junta as listas
     files_path_date = list(zip(files_path,files_date))
-    sorted_files_date = sorted(files_path_date, key=lambda x: parse_datetime(x[1]))
+
+    try:
+        sorted_files_date = sorted(files_path_date, key=lambda x: parse_datetime(x[1]))
+    except:
+        raise HTTPException(status_code=500, detail="Erro ao organizar os arquivos por data")
+    
     if verbose:
         print(f'Organizado {len(sorted_files_date)} arquivos por data')
     return sorted_files_date
 
 #Carrega as imagens
-def img_list_loader_gcs(list_of_img_urls, verbose=1):
+def img_list_loader_gcs(list_of_img_paths, verbose=1):
     """
     Carrega imagens a partir de URLs do Google Cloud Storage.
 
@@ -140,16 +276,17 @@ def img_list_loader_gcs(list_of_img_urls, verbose=1):
     """
     img_list = []
     if verbose:
-        print(f'Carregando {len(list_of_img_urls)} imagens do Google Cloud Storage')
+        print(f'Carregando {len(list_of_img_paths)} imagens do Google Cloud Storage')
 
-    for url in list_of_img_urls:
+    for path in list_of_img_paths:
         try:
-            storage_client = storage.Client()
-            blob = storage_client.get_blob_from_uri(url)  # Obtém o blob diretamente a partir da URL
+            print(f'Carregando imagem de {path[0]}')
+            blob =  bucket.blob(path[0])
             content = blob.download_as_bytes()  # Baixa o conteúdo do blob como bytes
             img_list.append(content)
         except Exception as e:
-            print(f"Erro ao carregar imagem de {url}: {e}")
+            print(f"Erro ao carregar imagem de {path[0]}: {e}")
+            raise HTTPException(status_code=500, detail=f"Erro ao carregar imagem de {path[0]}: {e}")
 
     if verbose:
         print(f'Carregado {len(img_list)} imagens do Google Cloud Storage')
@@ -157,60 +294,93 @@ def img_list_loader_gcs(list_of_img_urls, verbose=1):
 
 #Converte para o formato que o vertexAI entende
 def vertex_img_converter(img):
+    print(f'Convertendo imagem para o formato do vertexAI')
     encoded_img = base64.b64encode(img).decode('utf-8')
     vertex_img = Part.from_data(mime_type="image/jpeg",data=base64.b64decode(encoded_img))
     return vertex_img
 
-def save_to_excel(df, uuid_str, file_name="output", bucket_name="guardhouse_automation_bucket"):
-    # Salvar como arquivo Excel no GSC
+def save_to_excel(df, uuid_str, file_name="output", bucket=bucket):
+    """ Salva um DataFrame pandas no bucket do Google Cloud Storage. """
     # Criar um buffer na memória para o arquivo Excel
+    print("Salvando para excel")
     excel_buffer = io.BytesIO()
     # Salvar o DataFrame no buffer
     df.to_excel(excel_buffer, index=False, engine="openpyxl")
     # Resetar o ponteiro do buffer para o início
     excel_buffer.seek(0)
-
+    print('Salvo excel com sucesso')
     # Inicializar o cliente do Storage
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(f"{uuid_str}/output/{file_name}")
-
+    
     # Fazer o upload do buffer para o GCS
-    blob.upload_from_file(excel_buffer, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-
+    try:
+        blob.upload_from_file(excel_buffer, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    except:
+        print("Erro ao salvar excel no bucket")
+        raise HTTPException(status_code=500, detail="Erro ao salvar excel no bucket")
 
 def convert_to_excel(output, file_name="output"):
-    # Converter a saída para um DataFrame do pandas 
-    output_io = StringIO(output)
-    df = pd.read_table(output_io, sep="|", skiprows=0, skipinitialspace=True).reindex()
-    df.dropna(axis=1, how="all", inplace=True)
-    df.drop(index=0, inplace=True)
+    """Converte a saída de texto do Gemini em um DataFrame pandas."""
+    try:
+        # Converter a saída para um DataFrame do pandas 
+        output_io = StringIO(output)
+        #Converte a tabela markdown em um dataframe
+        df = pd.read_table(output_io, sep="|", skiprows=0, skipinitialspace=True).reindex()
+        #Limpa linhas sem nada
+        df.dropna(axis=1, how="all", inplace=True)
+        df.drop(index=0, inplace=True)
+    except:
+        print("Erro ao converter a saída de texto do Gemini em um DataFrame pandas")
+        raise HTTPException(status_code=500, detail="Erro ao converter a saída de texto do Gemini em um DataFrame pandas")
     return df
     
 
 app = FastAPI()
 
-BUCKET_NAME="guardhouse_automation_bucket"
-FILE_NAME = "output"
-UPLOAD_DIRECTORY = "uploads"  # Diretório para salvar os uploads (localmente)
-
 
 os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
 
 @app.post("/upload")
-async def upload_images(files: List[UploadFile], uuid: str = Query(None), img_type: str = Query(None)):
-    upload_imgs(files, img_type, uuid)
+async def upload_images(files: List[UploadFile] = File(...), 
+                        uuid: str = Form(None), 
+                        img_type: str = Form(None)):
+    logger.debug(f"Iniciando upload: uuid={uuid}, img_type={img_type}")
+    if uuid:
+        print('UUID encontrado')
+    if not uuid:
+        logger.debug("UUID ausente")
+        raise HTTPException(status_code=422, detail="UUID é obrigatório")
+
+    if not img_type:
+        logger.debug("img_type ausente")
+        raise HTTPException(status_code=422, detail="img_type é obrigatório")
+
+    if img_type not in ["documentos", "placas"]:
+        logger.debug(f"img_type inválido: {img_type}")
+        raise HTTPException(status_code=422, detail="Tipo de imagem inválido")
+
+    logger.debug(f"Número de arquivos recebidos: {len(files)}")
+
+    await upload_imgs(files, img_type, uuid)
     return JSONResponse(content={"message": "Arquivos enviados com sucesso."})
 
 @app.get("/get_sheets")
-async def get_sheets(uuid: str = Query(None)):
-    docs_paths, plates_paths = list_files_gcs(uuid)
-    sorted_docs_dates, sorted_plates_dates = sort_by_date(docs_paths), sort_by_date(plates_paths)
-    docs_img_list, plates_img_list = img_list_loader_gcs(sorted_docs_dates), img_list_loader_gcs(sorted_plates_dates)
+async def get_sheets(uuid: str = Form(None)):
+    try:
+        docs_paths, plates_paths = list_files_gcs(uuid)
+        sorted_docs_dates, sorted_plates_dates = sort_by_date(docs_paths), sort_by_date(plates_paths)
+        docs_img_list, plates_img_list = img_list_loader_gcs(sorted_docs_dates), img_list_loader_gcs(sorted_plates_dates)
+    except:
+        raise HTTPException(status_code=500, detail="não foi possivel listar os arquivos")
     #organiza em um lista só primeiro documento depois placa
-    imgs_list =  [item for pair in zip(docs_img_list, plates_img_list) for item in pair]
-    vertex_imgs_list = list(map(vertex_img_converter,imgs_list))
-    
+    try:
+        imgs_list =  [item for pair in zip(docs_img_list, plates_img_list) for item in pair]
+    except:
+        HTTPException(status_code=500, detail="não foi possivel organizar as imagens")
+    try:
+        vertex_imgs_list = list(map(vertex_img_converter,imgs_list))
+    except:
+        HTTPException(status_code=500, detail="não foi possivel converter as imagens")
     #Configuração da API VertexAI para usar o projeto e o modelo do gemini
     vertexai.init(project="guardautomation", location="southamerica-east1")
     model = GenerativeModel(
@@ -272,24 +442,30 @@ async def get_sheets(uuid: str = Query(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao gerar a tabela {str(e)}")
 
-@app.get("/download/{uuid}")
-async def download_file(uuid: str):
+@app.get("/download")
+async def download_file(uuid: str = Form(None), 
+                        filename: str = Form(None), 
+                        directory: str = Form(None),
+                        ):
     try:
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
-        blob_name = f"{uuid}/output/output.xlsx"
+        blob_name = f"{uuid}/{directory}/{filename}"
         blob = bucket.blob(blob_name)
 
         if not blob.exists():
+            print('Blob do arquivo excel não existe')
             raise HTTPException(status_code=404, detail="File not found")
+        
+        content = blob.download_as_bytes()
+
 
         def iter_content():  #função generator para otimizar o envio de arquivos grandes
-            yield from blob.iter_content()
+            yield content
         
-        return StreamingResponse(iter_content(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename={FILE_NAME}.xlsx"})
+        return StreamingResponse(iter_content(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Erro ao carregar arquivo de {blob_name}: {e}") 
+        raise HTTPException(status_code=500, detail=f"Erro ao carregar arquivo de {blob_name}: {e}")
 
 @app.get("/files") #rota para listar os arquivos
 async def list_files():
