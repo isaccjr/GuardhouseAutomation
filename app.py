@@ -23,8 +23,9 @@ def download_excel_from_api(api_url = FASTAPI_URL, filename="output", directory=
         st.error(f"Ocorreu um erro: {e}")
 
 
-
-st.title("GuardHouse Automation")
+# Centralizar a imagem usando colunas 
+col1, col2, col3 = st.columns([1, 2, 1]) 
+with col2: st.image('imagens/logo.png', use_container_width=True)
 
 # Inicializa o UUID no session_state, se ainda não existir
 if "uuid_str" not in st.session_state:
@@ -32,20 +33,23 @@ if "uuid_str" not in st.session_state:
     st.write("Novo UUID gerado:", st.session_state.uuid_str) #exibe o uuid gerado
 
 
-st.write('''O GuardHouse Automation é um aplicativo de automação de guarita, 
-         você enviar fotos de documentos e de carros e recebe um arquivo excel
+st.write('''    O GuardHouse Automation é um aplicativo de automação de guarita, 
+         você envia fotos de documentos e de carros e recebe um arquivo excel
          com nome, cpf, rg, placa, modelo do carro e fabricante.
-         Tudo automaticamente sem necessidade de anotar ou digitar manualmente.
-         Não precisa se preocupar com a ordem de envio dos arquivos.
-         O aplicativo vai fazer a inferencia de qual documento é de qual motorista pelo horario 
-         da foto. 
-         Então é só tirar as fotos na sequência documento do condutor, foto do carro pegando a placa.
-         Tem que ter a mesma quantidade de fotos de documentos e de carros.
-         Não use fotos recebidas por WhatsApp ou qualquer aplicativo de mensageria, o aplicativo
-         não tem como inferir a ordem das fotos de arquivos desses aplicativos por excluirem os 
-         metadados para sua privacidade.
-         Selecione as fotos e aperte em enviar.
-         Em poucos segundos você receberá o arquivo com sua tabela.''')
+        Tudo automaticamente sem necessidade de anotar ou digitar manualmente.
+        Não precisa se preocupar com a ordem de envio dos arquivos.
+        O aplicativo vai fazer a inferência de qual documento é de qual motorista pelo horario da foto.
+        Então é só tirar as fotos na sequência documento do condutor, foto do carro pegando a placa.
+        Tem que ter a mesma quantidade de fotos de documentos e de carros.
+        Não use fotos recebidas por WhatsApp ou qualquer aplicativo de mensageria, o aplicativo não tem 
+        como inferir a ordem das fotos de arquivos desses aplicativos por excluirem os metadados 
+        para sua privacidade.
+        Selecione as fotos e aperte em enviar.
+        Em poucos segundos você receberá o arquivo com sua tabela.''')
+
+col1, col2, col3 = st.columns([1, 2, 1]) 
+with col1: st.image('imagens/exemplo_documento.jpeg', use_container_width=True)
+with col3: st.image('imagens/exemplo_placa.jpg', use_container_width=True)
 
 # Campos de upload separados
 documentos = st.file_uploader("Selecione os Documentos", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
