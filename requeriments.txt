@@ -1,0 +1,10 @@
+pip install pandas
+pip install streamlit
+pip install fastapi 
+pip install uvicorn
+pip install requests
+pip install openpyxl
+pip install exifread
+pip install google-cloud-storage
+pip install vertexai
+
