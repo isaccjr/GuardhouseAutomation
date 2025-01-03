@@ -7,4 +7,5 @@ pip install openpyxl
 pip install exifread
 pip install google-cloud-storage
 pip install vertexai
+pip install easyocr
 

@@ -1,3 +1,4 @@
+import anyio.to_thread
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import List
@@ -15,6 +16,8 @@ import pandas as pd
 import logging
 import re 
 import pickle
+import anyio
+
 
 BUCKET_NAME="guardhouse_automation_bucket"
 FILE_NAME = "output"
@@ -27,7 +30,6 @@ logger = logging.getLogger(__name__)
 #Configuração do client de storage do Google Cloud Service
 storage_client = storage.Client()
 bucket = storage_client.bucket(BUCKET_NAME)
-
 
 
 
@@ -329,16 +331,34 @@ def convert_to_excel(output, file_name="output"):
         #Limpa linhas sem nada
         df.dropna(axis=1, how="all", inplace=True)
         df.drop(index=0, inplace=True)
-    except:
+    except Exception as e:
+        logger.error("Erro ao converter a saída de texto do Gemini em um DataFrame pandas")
+        logger.error(e)
+        logger.error(f"Output:{output}")
         print("Erro ao converter a saída de texto do Gemini em um DataFrame pandas")
         raise HTTPException(status_code=500, detail="Erro ao converter a saída de texto do Gemini em um DataFrame pandas")
     return df
-    
+
+async def iter_responses(model, prompt, generation_config, safety_settings): 
+        logger.debug("Iniciando iter_responses") 
+        try: 
+            logger.debug("Chamando Gemini") 
+            response = await model.generate_content_async( 
+                    prompt, 
+                    generation_config=generation_config, 
+                    safety_settings=safety_settings
+                )
+            logger.debug("Chamado com sucesso") 
+            logger.debug(f"Resposta do Gemini: {response.text}")
+            yield response.text
+        except Exception as e: 
+            logger.error(f"Erro ao receber resposta do Gemini: {e}") 
+            raise HTTPException(status_code=500, detail="Erro ao receber resposta do Gemini")
 
 app = FastAPI()
-
-
 os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
+
+
 
 @app.post("/upload")
 async def upload_images(files: List[UploadFile] = File(...), 
@@ -364,83 +384,92 @@ async def upload_images(files: List[UploadFile] = File(...),
     await upload_imgs(files, img_type, uuid)
     return JSONResponse(content={"message": "Arquivos enviados com sucesso."})
 
-@app.get("/get_sheets")
+@app.post("/get_sheets")
 async def get_sheets(uuid: str = Form(None)):
     try:
-        docs_paths, plates_paths = list_files_gcs(uuid)
-        sorted_docs_dates, sorted_plates_dates = sort_by_date(docs_paths), sort_by_date(plates_paths)
-        docs_img_list, plates_img_list = img_list_loader_gcs(sorted_docs_dates), img_list_loader_gcs(sorted_plates_dates)
-    except:
-        raise HTTPException(status_code=500, detail="não foi possivel listar os arquivos")
-    #organiza em um lista só primeiro documento depois placa
-    try:
-        imgs_list =  [item for pair in zip(docs_img_list, plates_img_list) for item in pair]
-    except:
-        HTTPException(status_code=500, detail="não foi possivel organizar as imagens")
-    try:
-        vertex_imgs_list = list(map(vertex_img_converter,imgs_list))
-    except:
-        HTTPException(status_code=500, detail="não foi possivel converter as imagens")
-    #Configuração da API VertexAI para usar o projeto e o modelo do gemini
-    vertexai.init(project="guardautomation", location="southamerica-east1")
-    model = GenerativeModel(
-        "gemini-1.5-pro-002",
-    )
-    #Prompt para o Gemini tratar as imagens
-    text1 = """Crie uma tabela com a placa, modelo, marca do carro, cor,  nome, cpf, rg. 
-               Nome, cpf e rg estão nas imagens posteriores a dos carros, 
-               a imagem 1 com a 2 e a 3 com a 4 e assim posteriormente.
-               rg é geralmente identificado por doc. identidade e seguido pelo orgão emissor, cpf tem 11 digitos.
-               Se for possivel retirar algum dados de alguma foto marque a informação com ilegível. 
-               Responda somente a tabela nada além da tabela, sem texto antes ou depois da tabela"""
+        try:
+            docs_paths, plates_paths = list_files_gcs(uuid)
+            sorted_docs_dates, sorted_plates_dates = sort_by_date(docs_paths), sort_by_date(plates_paths)
+            docs_img_list, plates_img_list = img_list_loader_gcs(sorted_docs_dates), img_list_loader_gcs(sorted_plates_dates)
+        except:
+            raise HTTPException(status_code=500, detail="não foi possivel listar os arquivos")
+        #organiza em um lista só primeiro documento depois placa
+        try:
+            imgs_list =  [item for pair in zip(docs_img_list, plates_img_list) for item in pair]
+        except:
+            HTTPException(status_code=500, detail="não foi possivel organizar as imagens")
+        try:
+            vertex_imgs_list = list(map(vertex_img_converter,imgs_list))
+        except:
+            HTTPException(status_code=500, detail="não foi possivel converter as imagens")
 
-    generation_config = {
-    "max_output_tokens": 8192,
-    "temperature": 0,
-    "top_p": 0.95,
-}
+        #Configuração da API VertexAI para usar o projeto e o modelo do gemini
+        vertexai.init(project="guardautomation", location="southamerica-east1")
 
-    safety_settings = [
-    SafetySetting(
-        category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-        threshold=SafetySetting.HarmBlockThreshold.OFF
-    ),
-    SafetySetting(
-        category=SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        threshold=SafetySetting.HarmBlockThreshold.OFF
-    ),
-    SafetySetting(
-        category=SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-        threshold=SafetySetting.HarmBlockThreshold.OFF
-    ),
-    SafetySetting(
-        category=SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT,
-        threshold=SafetySetting.HarmBlockThreshold.OFF
-    ),
-]
+        model = GenerativeModel("gemini-1.5-pro-002",)
+        #Prompt para o Gemini tratar as imagens
+        text1 = """Crie uma tabela com a placa, modelo, marca do carro, cor,  nome, cpf, rg. 
+                Nome, cpf e rg estão nas imagens posteriores a dos carros, 
+                a imagem 1 com a 2 e a 3 com a 4 e assim posteriormente.
+                rg é geralmente identificado por doc. identidade e seguido pelo orgão emissor, cpf tem 11 digitos.
+                Se for possivel retirar algum dados de alguma foto marque a informação com ilegível. 
+                Responda somente a tabela nada além da tabela, sem texto antes ou depois da tabela"""
 
-    #Combina as imagens com o texto de prompt
-    prompt = vertex_imgs_list + [text1]
-    #Chamada da API Vertex AI usando o Gemini como modelo
-    responses = model.generate_content(
-        prompt,
-        generation_config=generation_config,
-        safety_settings=safety_settings,
-        stream=True,
-    )
-    # Usar StringIO para capturar a saída do loop de impressão 
-    output_buffer = io.StringIO()
-    for response in responses:
-        output_buffer.write(response.text) 
-    # Salvar a saída na variável output 
-    output = output_buffer.getvalue() 
-    output_buffer.close()
-    try:
-        df = convert_to_excel(output)
-        save_to_excel(df, uuid)
-        return JSONResponse(content={"message": "Tabela gerada com sucesso."}, status_code=200)
+        generation_config = {
+        "max_output_tokens": 8192,
+        "temperature": 0,
+        "top_p": 0.95,
+        }
+
+        safety_settings = [
+        SafetySetting(
+            category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold=SafetySetting.HarmBlockThreshold.OFF
+        ),
+        SafetySetting(
+            category=SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+            threshold=SafetySetting.HarmBlockThreshold.OFF
+        ),
+        SafetySetting(
+            category=SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            threshold=SafetySetting.HarmBlockThreshold.OFF
+        ),
+        SafetySetting(
+            category=SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold=SafetySetting.HarmBlockThreshold.OFF
+        ),
+        ]
+
+        #Combina as imagens com o texto de prompt
+        prompt = vertex_imgs_list + [text1]
+        output = ""  # Initialize output outside the generator
+
+        async def stream_generator():
+            nonlocal output  # Access and modify the outer scope 'output'
+            try:
+                async for response_text in iter_responses(model, prompt, generation_config, safety_settings):
+                    output += response_text  # Accumulate the response
+                    yield response_text
+
+            except HTTPException as e:
+                raise  # Re-raise HTTPExceptions
+            except Exception as e:
+                logger.error(f"Erro no iter_responses: {e}")
+                raise HTTPException(status_code=500, detail=f"Erro ao gerar a tabela: {e}")
+            finally: # This ensures the Excel file is created even if there's an error during streaming
+                try:
+                    df = convert_to_excel(output)
+                    save_to_excel(df, uuid)
+                    logger.debug("Tabela salva com sucesso.")
+                except Exception as e:
+                    logger.error(f"Erro ao processar a saída: {e}")
+                    raise HTTPException(status_code=500, detail=f"Erro ao salvar a tabela: {e}")
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao gerar a tabela {str(e)}")
+        logger.error(f"Erro geral no get_sheets: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao processar a requisição: {str(e)}")
 
 @app.get("/download")
 async def download_file(uuid: str = Form(None), 

@@ -3,6 +3,7 @@ import requests
 import os
 import uuid
 import io  # Importei o módulo io para trabalhar com BytesIO
+import pandas as pd
 
 FASTAPI_URL = "http://127.0.0.1:8000"
 
@@ -23,6 +24,26 @@ def download_excel_from_api(api_url = FASTAPI_URL, filename="output", directory=
         st.error(f"Ocorreu um erro: {e}")
 
 
+def processar_respostas(api_url, uuid_str): 
+    print("Processando respostas") 
+    df = pd.DataFrame(columns=["Placa", "Modelo", "Marca", "Cor", "Nome", "CPF", "RG"]) 
+    def add_row(df, Placa, Modelo, Marca, Cor, Nome, CPF, RG): 
+        new_row = pd.DataFrame({'Placa': [Placa], 'Modelo': [Modelo], 'Marca': [Marca], 'Cor': [Cor], 'Nome': [Nome], 'CPF': [CPF], 'RG': [RG]}) 
+        return pd.concat([df, new_row], ignore_index=True) 
+    response = requests.post(api_url, data={"uuid": uuid_str}, stream=True) 
+    if response.status_code == 200: 
+        table_placeholder = st.empty() # Reserva espaço para a tabela 
+        for idx, line in enumerate(response.iter_lines()): 
+            if idx < 2: continue # Ignora as duas primeiras linhas 
+            if line: decoded_line = line.decode('utf-8') 
+            line_splited = decoded_line.split("|")[1:-1] 
+            line_splited = [item.strip() for item in line_splited] 
+            placa, modelo, marca, cor, nome, cpf, rg = line_splited 
+            df = add_row(df, placa, modelo, marca, cor, nome, cpf, rg) 
+            table_placeholder.dataframe(df) # Atualiza a tabela no espaço reservado 
+        return True 
+    else:
+        st.error(f"Erro ao processar as respostas: {response.json()['detail']}")
 # Centralizar a imagem usando colunas 
 col1, col2, col3 = st.columns([1, 2, 1]) 
 with col2: st.image('imagens/logo.png', use_container_width=True)
@@ -88,8 +109,8 @@ if st.button("Enviar Imagens"):
         # Verifica se a mensagem de sucesso está na resposta
         if doc_sucess_response and plate_sucess_response:
             st.success(f"Todas as imagens de enviadas com sucesso!")
-            response =requests.get(f"{FASTAPI_URL}/get_sheets", data={"uuid":uuid_str})
-            if response.status_code == 200:
+            sucesso =processar_respostas(f"{FASTAPI_URL}/get_sheets", uuid_str)
+            if sucesso:
                 st.success("Tabela gerada com sucesso!")
                 download_excel_from_api(uuid_str=uuid_str)
             else:
